@@ -139,6 +139,25 @@ def to_int(v, default=0):
         return default
 
 
+def game_achievements(path, older_than=0):
+    """(unlocked, total) from Steam's per-game library cache file, if it was written after `older_than` (Unix
+    seconds) and counts any achievements; otherwise None. The file is a list of [section, {version, data}]."""
+    try:
+        if os.path.getmtime(path) <= older_than:
+            return None
+        with open(path, encoding='utf-8') as f:
+            sections = json.load(f)
+        for item in sections if isinstance(sections, list) else []:
+            if isinstance(item, list) and len(item) == 2 and item[0] == 'achievements' and isinstance(item[1], dict):
+                data = item[1].get('data') or {}
+                total = to_int(data.get('nTotal'))
+                if total > 0:
+                    return to_int(data.get('nAchieved')), total
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
 # ------------------------------------------------------------------ binary VDF (KeyValues)
 T_SECTION, T_STRING, T_INT32, T_FLOAT, T_PTR, T_WSTRING, T_COLOR, T_UINT64, T_END, T_INT64, T_END2 = 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11
 
@@ -962,18 +981,32 @@ def main():
     if a.max_games > 0:
         games = games[:a.max_games]
 
-    # Achievements: Steam caches each game's progress (unlocked of total) for its library page.
+    # Achievements: Steam keeps a summary of each game's progress (unlocked of total) in achievement_progress.json,
+    # but only updates it now and then, so it goes stale (a newer device may have only a few games in it). Steam
+    # also writes one file per game (librarycache/<appid>.json) whenever that game's library page is shown; where
+    # that file is newer than the summary's entry, its counts win.
+    cache = os.path.join(userdir, 'config', 'librarycache')
     try:
-        with open(os.path.join(userdir, 'config', 'librarycache', 'achievement_progress.json'), encoding='utf-8') as f:
+        with open(os.path.join(cache, 'achievement_progress.json'), encoding='utf-8') as f:
             ach = {int(k): v for k, v in json.load(f).get('mapCache', [])}
     except (OSError, ValueError, TypeError):
         ach = {}
+    newer = 0
     for g in games:
-        p = ach.get(g['appid']) if isinstance(g['appid'], int) else None
-        if p and to_int(p.get('total')) > 0:
-            g['achievements'] = {'unlocked': to_int(p.get('unlocked')), 'total': to_int(p.get('total'))}
-    if ach:
-        log('Achievements: %d games' % sum(1 for g in games if 'achievements' in g))
+        if not isinstance(g['appid'], int) or g.get('nonSteam'):
+            continue
+        p = ach.get(g['appid']) or {}
+        unlocked, total = to_int(p.get('unlocked')), to_int(p.get('total'))
+        own = game_achievements(os.path.join(cache, '%d.json' % g['appid']), to_int(p.get('cache_time')))
+        if own:
+            if own != (unlocked, total):
+                newer += 1
+            unlocked, total = own
+        if total > 0:
+            g['achievements'] = {'unlocked': min(unlocked, total), 'total': total}
+    n = sum(1 for g in games if 'achievements' in g)
+    if n:
+        log('Achievements: %d games' % n + (' (%d newer than Steam\'s summary)' % newer if newer else ''))
 
     # Write. Folders of games that are gone are removed; files whose source is unchanged are reused.
     clean_library(lib, {str(g['appid']) for g in games})

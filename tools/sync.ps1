@@ -832,17 +832,50 @@ function Fetch-Art([string]$url, [string]$dir, [string]$stem, $l) {
 
 $total = 0L
 $fetched = 0; $dropped = 0
-# Achievements: Steam caches each game's progress (unlocked of total) for its library page.
-$ach = @{}
+# Achievements: Steam keeps a summary of each game's progress (unlocked of total) in achievement_progress.json, but
+# only updates it now and then, so it goes stale (a newer PC may have only a few games in it). Steam also writes one
+# file per game (librarycache\<appid>.json) whenever that game's library page is shown; where that file is newer
+# than the summary's entry, its counts win.
+$achDir = Join-Path $userDir 'config\librarycache'
+$ach = @{}; $achTime = @{}; $achNewer = 0
 try {
-  $achFile = Join-Path $userDir 'config\librarycache\achievement_progress.json'
+  $achFile = Join-Path $achDir 'achievement_progress.json'
   if (Test-Path -LiteralPath $achFile) {
     foreach ($pair in (Get-Content -LiteralPath $achFile -Raw -Encoding UTF8 | ConvertFrom-Json).mapCache) {
       $aid = ToAppId $pair[0]
-      if ($aid -ge 0 -and $pair[1].total -gt 0) { $ach[$aid] = [ordered]@{ unlocked = [int]$pair[1].unlocked; total = [int]$pair[1].total } }
+      if ($aid -lt 0) { continue }
+      $achTime[$aid] = [long]$pair[1].cache_time
+      if ($pair[1].total -gt 0) { $ach[$aid] = [ordered]@{ unlocked = [int]$pair[1].unlocked; total = [int]$pair[1].total } }
     }
   }
-} catch { $ach = @{} }
+} catch { $ach = @{}; $achTime = @{} }
+# (unlocked, total) from a game's own cache file when it was written after $olderThan (Unix seconds) and counts any
+# achievements, else $null. Read as text: the counts sit in its "achievements" section as nTotal and nAchieved.
+function Get-GameAchievements([string]$path, [long]$olderThan) {
+  try {
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $item = Get-Item -LiteralPath $path
+    if ([DateTimeOffset]::new($item.LastWriteTimeUtc).ToUnixTimeSeconds() -le $olderThan) { return $null }
+    $text = [IO.File]::ReadAllText($path)
+    $at = $text.IndexOf('["achievements"')
+    if ($at -lt 0) { return $null }
+    $section = $text.Substring($at)
+    $t = [regex]::Match($section, '"nTotal"\s*:\s*(\d+)'); $a = [regex]::Match($section, '"nAchieved"\s*:\s*(\d+)')
+    if (-not $t.Success -or -not $a.Success -or [int]$t.Groups[1].Value -le 0) { return $null }
+    return @([int]$a.Groups[1].Value, [int]$t.Groups[1].Value)
+  } catch { return $null }
+}
+foreach ($g in $games) {
+  if ($g.nonSteam) { continue }
+  $aid = [long]$g.appid
+  $older = if ($achTime.ContainsKey($aid)) { $achTime[$aid] } else { 0L }
+  $own = Get-GameAchievements (Join-Path $achDir ('{0}.json' -f $aid)) $older
+  if ($own) {
+    $was = $ach[$aid]
+    if (-not $was -or $was.unlocked -ne $own[0] -or $was.total -ne $own[1]) { $achNewer++ }
+    $ach[$aid] = [ordered]@{ unlocked = [math]::Min($own[0], $own[1]); total = $own[1] }
+  }
+}
 
 $out = New-Object System.Collections.ArrayList
 foreach ($g in $games) {
@@ -929,6 +962,8 @@ $total += $js.Length
 
 $sk = ($skipped.Keys | Where-Object { $skipped[$_] } | ForEach-Object { "$($skipped[$_]) $_" }) -join ', '
 Log ("Games: {0} ({1} non-Steam). Skipped: {2}" -f $out.Count, @($out | Where-Object { $_['nonSteam'] }).Count, $sk)
+$achCount = @($out | Where-Object { $_.Contains('achievements') }).Count
+if ($achCount) { Log ("Achievements: {0} games{1}" -f $achCount, $(if ($achNewer) { " ($achNewer newer than Steam's summary)" } else { '' })) }
 Log ("Screenshots: {0}. Output: {1:N1} MB in {2}" -f $shots.Count, ($total / 1MB), $lib)
 
 $p = $targetDir
