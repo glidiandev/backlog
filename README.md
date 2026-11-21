@@ -102,6 +102,8 @@ Every line is explained there. The ones people change most:
 | `clock.show` | What the clock corner shows: `'all'`, `'clock'` (the time and date, without your games and total hours) or `'none'` (no clock). The installer sets this for you. |
 | `featured` | Your favorites. The whole library still fills the scenes, but only these games take the spotlight and make Mosaic's pictures. |
 | `library.exclude` | Games to never show, by name or app id. |
+| `library.showHidden` | The games you hid in Steam are left out of Backlog too, screenshots included. Set it to `true` to show them anyway. |
+| `library.minMinutes` | Skip games with less playtime than this. `1` shows only games you've played. |
 | `library.merge` | Show several entries as one game with the hours added up. Entries with the same name join on their own. |
 | `extraGames` | Games Steam doesn't know about, with your own art. |
 | `oled` | Care for OLED screens: a slow pixel shift, dimming at night, and an optional fade to black. |

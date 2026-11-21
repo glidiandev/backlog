@@ -27,6 +27,8 @@ What is read (nothing else, and nothing private is written out):
   appcache/librarycache/                              art (per-appid folders, hash subfolders, or the old flat names)
   userdata/<id>/config/grid/                          the user's own custom art (wins over Steam's)
   userdata/<id>/config/shortcuts.vdf (binary)         non-Steam games that have custom art
+  userdata/<id>/config/cloudstorage/                  the games you hid in Steam (non-Steam ones: in localconfig.vdf),
+                                                      left out unless config.js says showHidden: true
   userdata/<id>/760/remote/<appid>/screenshots/       screenshots (newest N)
 """
 import argparse, hashlib, json, os, re, shutil, struct, sys, time, zlib
@@ -432,10 +434,80 @@ def grid_art(grid_files, appid):
     return art
 
 
+def collection_ids(coll):
+    """The app ids in one Steam collection, {"id":..,"added":[ids],"removed":[ids]}: added minus removed. A 64-bit
+    game id (a non-Steam shortcut id in the top 32 bits) becomes that 32-bit shortcut id."""
+    out = set()
+    if not isinstance(coll, dict):
+        return out
+    removed = {to_int(x) for x in coll.get('removed') or []}
+    for x in coll.get('added') or []:
+        n = to_int(x)
+        if n <= 0 or n in removed:
+            continue
+        out.add(n if n <= 0xFFFFFFFF else (n >> 32) & 0xFFFFFFFF)
+    return out
+
+
+def find_ci(d, key):
+    """The first value anywhere in a nested dict whose key is `key` (any case), else None."""
+    if not isinstance(d, dict):
+        return None
+    for k, v in d.items():
+        if k.lower() == key:
+            return v
+    for v in d.values():
+        hit = find_ci(v, key)
+        if hit is not None:
+            return hit
+    return None
+
+
+def shows_hidden(target):
+    """True when the installed config.js turns showHidden on (library: { ..., showHidden: true }). Lines that are
+    comments don't count; a missing or unreadable config.js means off."""
+    try:
+        with open(os.path.join(target, 'config.js'), encoding='utf-8') as f:
+            text = f.read()
+    except OSError:
+        return False
+    text = re.sub(r'(?m)^\s*//.*$', '', text)
+    return re.search(r'\bshowHidden\s*:\s*true\b', text) is not None
+
+
+def hidden_apps(userdir, localconfig):
+    """App ids of the games hidden in Steam (Manage > Hide this game). Steam keeps them in two places (checked on a
+    Steam Deck, 2026-11-21): Steam games in the "Hidden" collection it syncs to the cloud, the 'user-collections.hidden'
+    entry of config/cloudstorage/cloud-storage-namespace-1.json (a list of [key, entry] pairs; the entry's value is a
+    JSON string), and non-Steam games only on the device, in localconfig.vdf's "user-collections" value (a JSON string
+    of collections by id, with a "hidden" one). Anything unreadable adds nothing."""
+    out = set()
+    try:
+        with open(os.path.join(userdir, 'config', 'cloudstorage', 'cloud-storage-namespace-1.json'),
+                  encoding='utf-8') as f:
+            pairs = json.load(f)
+        for item in pairs if isinstance(pairs, list) else []:
+            if isinstance(item, list) and len(item) == 2 and item[0] == 'user-collections.hidden':
+                entry = item[1] if isinstance(item[1], dict) else {}
+                if not entry.get('is_deleted'):
+                    out |= collection_ids(json.loads(entry.get('value') or '{}'))
+                break
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    try:
+        local = find_ci(localconfig, 'user-collections')
+        if isinstance(local, str) and local.strip():
+            out |= collection_ids((json.loads(local) or {}).get('hidden'))
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return out
+
+
 SHOT_NAME = re.compile(r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_\d+\.(?:jpe?g|png)$', re.I)
 
 
-def screenshots(userdir, limit):
+def screenshots(userdir, limit, skip=frozenset()):
+    """The newest `limit` screenshots, leaving out the games in `skip` (the ones hidden in Steam)."""
     base = os.path.join(userdir, '760', 'remote')
     found = []
     if not os.path.isdir(base):
@@ -449,7 +521,7 @@ def screenshots(userdir, limit):
         appid = int(aid)
         if appid > 0xFFFFFFFF:
             appid >>= 32
-        if appid > 0xFFFFFFFF:
+        if appid > 0xFFFFFFFF or appid in skip:
             continue
         for fn in os.listdir(d):
             p = os.path.join(d, fn)
@@ -977,6 +1049,17 @@ def main():
     if shortcuts:
         log('Non-Steam games: %d of %d kept (custom art or played)' % (ns, len(shortcuts)))
 
+    # Games hidden in Steam stay hidden here too, unless config.js says showHidden: true.
+    if shows_hidden(target):
+        hidden = set()
+        log('Hidden in Steam: shown (showHidden is on in config.js)')
+    else:
+        hidden = hidden_apps(userdir, lc)
+        kept = [g for g in games if g['appid'] not in hidden]
+        if len(kept) < len(games):
+            log('Hidden in Steam: %d left out (showHidden in config.js shows them)' % (len(games) - len(kept)))
+        games = kept
+
     games.sort(key=lambda g: (g['lastPlayed'], g['playtime']), reverse=True)
     if a.max_games > 0:
         games = games[:a.max_games]
@@ -1093,7 +1176,7 @@ def main():
         log('Store art: %d images for games this computer never showed; %d games had none' % (fetched, len(dropped)))
 
     shots = []
-    for s in screenshots(userdir, max(0, a.max_screenshots)):
+    for s in screenshots(userdir, max(0, a.max_screenshots), hidden):
         stem = '%d_%s' % (s['appid'], os.path.splitext(os.path.basename(s['src']))[0])
         name = put(s['src'], 'shots', stem)
         total += os.path.getsize(os.path.join(lib, 'shots', name))

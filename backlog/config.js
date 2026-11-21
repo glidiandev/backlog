@@ -29,7 +29,8 @@ window.BACKLOG_CONFIG = {
   // minMinutes: skip games with less playtime. exclude: app ids or names to never show.
   // merge: show several entries as one game, hours added up. Entries with the same name join on their own;
   // list differently named ones together, the name to show first.
-  library: { recentDays: 0, minMinutes: 0, exclude: [], merge: [] },
+  // showHidden: the games you hid in Steam are left out; true shows them anyway (from the next library refresh).
+  library: { recentDays: 0, minMinutes: 0, exclude: [], merge: [], showHidden: false },
 
   // Games Steam doesn't know about (PlayStation, Switch, other launchers). Art is optional: put your own images in
   // the my-art folder and name them here. Without a cover, the game's name is drawn in type.

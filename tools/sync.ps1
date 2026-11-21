@@ -10,7 +10,8 @@
   Reads: steamapps\libraryfolders.vdf + appmanifest_*.acf (installed games), userdata\<id>\config\localconfig.vdf
   (Playtime, LastPlayed), config\loginusers.vdf (last account, persona name), appcache\appinfo.vdf (names and types),
   appcache\librarycache\ (art), userdata\<id>\config\grid\ (your custom art, wins), userdata\<id>\config\shortcuts.vdf
-  (non-Steam games with custom art), userdata\<id>\760\remote\<appid>\screenshots\.
+  (non-Steam games with custom art), userdata\<id>\760\remote\<appid>\screenshots\, userdata\<id>\config\cloudstorage\
+  and localconfig.vdf (the games you hid in Steam, left out unless config.js says showHidden: true).
 
   Optional online refresh: with your own Steam Web API key (-ApiKey, STEAM_API_KEY, or
   %APPDATA%\backlog\steam-api-key.txt), playtime and last played come from Steam for every device, games played only
@@ -545,7 +546,8 @@ if ($Reset) {
 # ------------------------------------------------------------------ gather
 $played = @{}
 $scPlayed = @{}
-$appsCfg = G (ReadVdf (Join-Path $userDir 'config\localconfig.vdf')) 'UserLocalConfigStore' 'Software' 'Valve' 'Steam' 'apps'
+$localConfig = ReadVdf (Join-Path $userDir 'config\localconfig.vdf')
+$appsCfg = G $localConfig 'UserLocalConfigStore' 'Software' 'Valve' 'Steam' 'apps'
 if ($appsCfg) {
   foreach ($k in @($appsCfg.Keys)) {
     if ($k -notmatch '^-?\d+$') { continue }
@@ -770,6 +772,80 @@ if (-not $NoShortcuts) {
   if ($shortcuts.Count) { Log ("Non-Steam games: {0} of {1} kept (custom art or played)" -f $ns, $shortcuts.Count) }
 }
 
+# Adds the app ids of one Steam collection, given as JSON text {"id":..,"added":[ids],"removed":[ids]}, to $out: added
+# minus removed. A 64-bit game id (a non-Steam shortcut id in the top 32 bits) becomes that 32-bit shortcut id. The ids
+# are read as text so a 64-bit one never loses digits.
+function Add-CollectionIds($out, [string]$json) {
+  $removed = @{}
+  $rm = [regex]::Match($json, '"removed"\s*:\s*\[([^\]]*)\]')
+  if ($rm.Success) { foreach ($x in [regex]::Matches($rm.Groups[1].Value, '\d+')) { $removed[$x.Value] = $true } }
+  $ad = [regex]::Match($json, '"added"\s*:\s*\[([^\]]*)\]')
+  if (-not $ad.Success) { return }
+  foreach ($x in [regex]::Matches($ad.Groups[1].Value, '\d+')) {
+    if ($removed[$x.Value]) { continue }
+    $n = [decimal]$x.Value
+    if ($n -gt 4294967295) { $n = [math]::Floor($n / 4294967296) }
+    if ($n -gt 0 -and $n -le 4294967295) { $out[[uint32]$n] = $true }
+  }
+}
+
+# The first value anywhere in a parsed VDF whose key is $key (any case), else $null.
+function Find-VdfValue($d, [string]$key) {
+  if (-not ($d -is [System.Collections.IDictionary])) { return $null }
+  foreach ($k in @($d.Keys)) { if ($k -eq $key) { return $d[$k] } }
+  foreach ($v in @($d.Values)) { $hit = Find-VdfValue $v $key; if ($null -ne $hit) { return $hit } }
+  return $null
+}
+
+# App ids of the games hidden in Steam (Manage > Hide this game). Steam keeps them in two places (checked on a Steam
+# Deck, 2026-11-21): Steam games in the "Hidden" collection it syncs to the cloud, the 'user-collections.hidden' entry
+# of config\cloudstorage\cloud-storage-namespace-1.json (a list of [key, entry] pairs; the entry's value is a JSON
+# string), and non-Steam games only on the device, in localconfig.vdf's "user-collections" value (a JSON string of
+# collections by id, with a "hidden" one). Anything unreadable adds nothing.
+function Get-HiddenApps([string]$dir, $localConfig) {
+  $out = @{}
+  $file = Join-Path $dir 'config\cloudstorage\cloud-storage-namespace-1.json'
+  try {
+    if (Test-Path -LiteralPath $file) {
+      $pairs = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8) | ConvertFrom-Json
+      foreach ($p in $pairs) {
+        if (-not ($p -is [array] -and $p.Count -eq 2 -and $p[0] -eq 'user-collections.hidden')) { continue }
+        if (-not $p[1].is_deleted) { Add-CollectionIds $out ([string]$p[1].value) }
+        break
+      }
+    }
+  } catch {}
+  try {
+    $local = Find-VdfValue $localConfig 'user-collections'
+    if ($local -is [string]) {
+      $m = [regex]::Match($local, '"hidden"\s*:\s*(\{[^{}]*\})')
+      if ($m.Success) { Add-CollectionIds $out $m.Groups[1].Value }
+    }
+  } catch {}
+  return $out
+}
+
+# True when the installed config.js turns showHidden on (library: { ..., showHidden: true }). Lines that are comments
+# don't count; a missing or unreadable config.js means off.
+function Test-ShowHidden([string]$dir) {
+  $path = Join-Path $dir 'config.js'
+  if (-not (Test-Path -LiteralPath $path)) { return $false }
+  try { $text = [IO.File]::ReadAllText($path) } catch { return $false }
+  $text = [regex]::Replace($text, '(?m)^\s*//.*$', '')
+  return [regex]::IsMatch($text, '\bshowHidden\s*:\s*true\b')
+}
+
+# Games hidden in Steam stay hidden here too, unless config.js says showHidden: true.
+if (Test-ShowHidden $targetDir) {
+  $hidden = @{}
+  Log 'Hidden in Steam: shown (showHidden is on in config.js)'
+} else {
+  $hidden = Get-HiddenApps $userDir $localConfig
+  $kept = @($games | Where-Object { -not $hidden[[uint32]$_.appid] })
+  if ($kept.Count -lt $games.Count) { Log ("Hidden in Steam: {0} left out (showHidden in config.js shows them)" -f ($games.Count - $kept.Count)) }
+  $games = $kept
+}
+
 $games = @($games | Sort-Object -Property @{ Expression = 'lastPlayed'; Descending = $true }, @{ Expression = 'playtime'; Descending = $true })
 if ($MaxGames -gt 0 -and $games.Count -gt $MaxGames) { $games = @($games[0..($MaxGames - 1)]) }
 
@@ -919,7 +995,7 @@ if ($MaxScreenshots -gt 0 -and (Test-Path -LiteralPath $remote)) {
   $found = New-Object System.Collections.ArrayList
   foreach ($d in Get-ChildItem -LiteralPath $remote -Directory | Where-Object { $_.Name -match '^\d+$' }) {
     $shotId = ToAppId $d.Name
-    if ($shotId -lt 0) { continue }
+    if ($shotId -lt 0 -or $hidden[[uint32]$shotId]) { continue }
     $sd = Join-Path $d.FullName 'screenshots'
     if (-not (Test-Path -LiteralPath $sd)) { continue }
     foreach ($f in Get-ChildItem -LiteralPath $sd -File | Where-Object { $_.Extension -match '^\.(jpe?g|png)$' }) {
